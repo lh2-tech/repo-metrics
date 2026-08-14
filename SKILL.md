@@ -28,6 +28,42 @@ Metric 2 also emits its intermediate figures — `vendored_loc` and
 `generated_minified_loc` — so the subtraction can be audited rather than taken
 on trust.
 
+### Additive columns
+
+`logical_loc` is always the unmodified spec figure. These columns sit
+**alongside** it and never alter it:
+
+| Column | Meaning |
+|--------|---------|
+| `code_loc` | LOC excluding data/markup languages (see `DATA_LANGUAGES`) |
+| `data_loc` | `logical_loc − code_loc` |
+| `code_loc_pct` | share of `logical_loc` that is real source |
+| `primary_code_language` | largest language ignoring data/markup |
+| `top_data_languages` | the data languages driving `data_loc`, largest first |
+
+Report `logical_loc` and `code_loc` side by side. The deviation from the
+literal spec is then visible and auditable rather than silent, and a reviewer
+can see immediately when a repository is mostly data.
+
+Override the classification with `--data-languages` if a corpus needs it; it is
+seeded from `skills/dataset-repo-metrics` `NON_CODE_LANGUAGES` so both tools
+agree, which means HTML/CSS/Sass count as data, not code.
+
+## Metric 5: attestation form
+
+Metric 5 is sourced from vendor attestation, per the methodology. Generate a
+pre-filled form from any completed run:
+
+```bash
+python3 scripts/make_attestation_form.py --run outputs/run1
+```
+
+Every detectable field is pre-filled, so the vendor confirms or corrects rather
+than researching each repository. `Build & test status` is left blank unless a
+build was actually executed and passed — a detection gap is never presented as a
+verified negative. Repos missing a runtime, a manifest, or CI test config are
+flagged in `Notes / blockers`.
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -100,10 +136,16 @@ These are real findings from a production run, not hypotheticals.
 
 **Data files inflate LOC.** `scc` counts XML, JSON and SQL as code. On a
 CodeIgniter corpus, `sitemaps/*.xml` and `log/capistrano.log` produced 23M
-"LOC" for a repo holding ~115K lines of PHP — a ~200× overstatement, with
-XML at 99.2% of the total. Always read `primary_language` and
-`language_breakdown` before trusting `logical_loc`; if the primary language is
-XML or JSON, extend `--exclude-dirs`.
+"LOC" for a repo holding ~22K lines of code — with XML at 99.2% of the total.
+Across ten such repos, 66.6M `logical_loc` reduced to 1.3M `code_loc`, a 51×
+aggregate overstatement. This is why `code_loc` exists: read it next to
+`logical_loc` rather than trusting `logical_loc` alone.
+
+**A repo's build system is not its first manifest.** A PHP application
+carrying a `package.json` for frontend assets was reported as a Node project
+and given `npm install` as its build command. Detection now picks the build
+system matching `primary_code_language`, and `build_systems_detected` lists
+every system found so the choice can be checked.
 
 **The duplication fallback is not jscpd.** On the same repo jscpd reported
 2.58% and the built-in detector reported 0.0%. The fallback exists so a run
@@ -123,9 +165,10 @@ has to come from vendor attestation; no tool can extract what is not there.
 
 `repo`, `platform`, `analysis_branch`, `logical_loc`, `non_authored_loc`,
 `non_authored_pct`, `authored_loc`, `vendored_loc`, `generated_minified_loc`,
-`duplication_ratio`, `duplication_pct`, `duplication_engine`,
-`non_merge_commits`, `revert_commits_excluded`, `build_test_status`,
-`build_system`, `build_command`, `test_command`, `runtime_version`,
-`runtime_version_source`, `ci_runs_tests`, `dockerfile_present`,
-`primary_language`, `language_breakdown`, `contributors`, `first_commit`,
-`last_commit`, `measurement_seconds`, `status`, `error`.
+`code_loc`, `data_loc`, `code_loc_pct`, `primary_code_language`,
+`top_data_languages`, `duplication_ratio`, `duplication_pct`,
+`duplication_engine`, `non_merge_commits`, `revert_commits_excluded`,
+`build_test_status`, `build_system`, `build_systems_detected`, `build_command`,
+`test_command`, `runtime_version`, `runtime_version_source`, `ci_runs_tests`,
+`dockerfile_present`, `primary_language`, `language_breakdown`, `contributors`,
+`first_commit`, `last_commit`, `measurement_seconds`, `status`, `error`.

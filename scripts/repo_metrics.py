@@ -73,6 +73,17 @@ WIDE_EXTRA_EXCLUDE_DIRS = [
     ".yarn", "site-packages", "target", "out", ".next", ".nuxt", "coverage",
 ]
 
+# Languages scc counts as "Code" that a reviewer would not call source code.
+# Matches skills/dataset-repo-metrics NON_CODE_LANGUAGES so both tools agree,
+# plus WSDL, which shows up in legacy PHP corpora.
+# Used ONLY to derive the additive `code_loc` column. `logical_loc` is always
+# the unmodified spec figure and is never affected by this set.
+DATA_LANGUAGES = {
+    "JSON", "Plain Text", "XML", "Markdown", "CSV", "Text", "Properties File",
+    "SVG", "HTML", "CSS", "LESS", "Sass", "SCSS", "YAML", "TOML",
+    "Web Services Description Language",
+}
+
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rb", ".php",
     ".cs", ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".swift", ".rs",
@@ -411,8 +422,14 @@ def scc_code_total(scc_bin: str, repo: Path, extra: Optional[Sequence[str]] = No
 
 
 def collect_loc(scc_bin: str, repo: Path, exclude_dirs: Sequence[str],
-                timeout: int) -> Dict[str, Any]:
-    """Metrics 1 and 2, plus the intermediate figures that justify metric 2."""
+                timeout: int, data_languages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Metrics 1 and 2, plus the intermediate figures that justify metric 2.
+
+    `logical_loc` is the spec figure: scc's summed Code column over the whole
+    repo, with no filtering whatsoever. `code_loc` is an additional, additive
+    column that removes data/markup languages; it never alters `logical_loc`.
+    """
+    data_langs = set(data_languages) if data_languages is not None else DATA_LANGUAGES
     exclude_args: List[str] = []
     for name in exclude_dirs:
         exclude_args += ["--exclude-dir", name]
@@ -433,8 +450,24 @@ def collect_loc(scc_bin: str, repo: Path, exclude_dirs: Sequence[str],
     denom = sum(authored_by_lang.values()) or 1
     breakdown = "; ".join(f"{name}:{100.0 * loc / denom:.1f}%" for name, loc in ranked if loc)
 
+    code_only = {name: loc for name, loc in by_lang.items() if name not in data_langs and loc}
+    code_loc = sum(code_only.values())
+    data_loc = total_code - code_loc
+    # `primary_language` can read "XML" on a repo that is 99% sitemap dumps, which
+    # is useless on a vendor form; this reports the largest real source language.
+    primary_code = max(code_only.items(), key=lambda kv: kv[1])[0] if code_only else ""
+    ranked_data = sorted(
+        ((name, loc) for name, loc in by_lang.items() if name in data_langs and loc),
+        key=lambda kv: kv[1], reverse=True,
+    )[:3]
+
     return {
         "logical_loc": total_code,
+        "code_loc": code_loc,
+        "data_loc": data_loc,
+        "primary_code_language": primary_code,
+        "code_loc_pct": round(100.0 * code_loc / total_code, 2) if total_code else 0.0,
+        "top_data_languages": "; ".join(f"{name}:{loc}" for name, loc in ranked_data),
         "authored_loc": authored,
         "non_authored_loc": max(total_code - authored, 0),
         "non_authored_pct": round(100.0 * (total_code - authored) / total_code, 2) if total_code else 0.0,
@@ -638,8 +671,54 @@ def _json(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
-    """Best-effort identification of build system, commands and runtime version."""
+# Which build system belongs to which source language, so a PHP app carrying a
+# package.json for its frontend assets is not reported as a Node project.
+LANGUAGE_BUILD_SYSTEMS = {
+    "PHP": "php",
+    "JavaScript": "node", "TypeScript": "node", "Vue": "node", "JSX": "node", "TSX": "node",
+    "Python": "python",
+    "Go": "go",
+    "Java": "maven", "Kotlin": "gradle",
+    "Ruby": "ruby",
+    "C#": "dotnet",
+    "Rust": "cargo",
+}
+
+
+def detect_build_plans(repo: Path) -> List[BuildPlan]:
+    """Every build system present, most specific first."""
+    plans: List[BuildPlan] = []
+    for detector in (
+        _plan_node, _plan_php, _plan_python, _plan_go, _plan_maven, _plan_gradle,
+        _plan_ruby, _plan_cargo, _plan_dotnet, _plan_make, _plan_dockerfile,
+    ):
+        try:
+            plan = detector(repo)
+        except Exception:  # noqa: BLE001 - a bad manifest must not kill the repo
+            plan = None
+        if plan:
+            plans.append(plan)
+    return plans
+
+
+def detect_build_plan(repo: Path, primary_language: str = "") -> Optional[BuildPlan]:
+    """Pick the build system matching the repo's primary source language.
+
+    Falls back to detection order when the primary language has no build system
+    or that system is not present in the repo.
+    """
+    plans = detect_build_plans(repo)
+    if not plans:
+        return None
+    preferred = LANGUAGE_BUILD_SYSTEMS.get(primary_language)
+    if preferred:
+        for plan in plans:
+            if plan.system == preferred:
+                return plan
+    return plans[0]
+
+
+def _plan_node(repo: Path) -> Optional[BuildPlan]:
     pkg = repo / "package.json"
     if pkg.is_file():
         data = _json(pkg)
@@ -659,7 +738,10 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
         test = "npm test" if "test" in scripts else ""
         major = re.sub(r"[^0-9.].*$", "", runtime).split(".")[0] or "20"
         return BuildPlan("node", build, test, runtime, source, f"node:{major}")
+    return None
 
+
+def _plan_go(repo: Path) -> Optional[BuildPlan]:
     if (repo / "go.mod").is_file():
         version = ""
         match = re.search(r"^go\s+([0-9.]+)", _read(repo / "go.mod"), re.M)
@@ -667,7 +749,10 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
             version = match.group(1)
         return BuildPlan("go", "go build ./...", "go test ./...", version, "go.mod",
                          f"golang:{version or '1.22'}")
+    return None
 
+
+def _plan_maven(repo: Path) -> Optional[BuildPlan]:
     if (repo / "pom.xml").is_file():
         version = ""
         text = _read(repo / "pom.xml")
@@ -676,7 +761,10 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
             version = match.group(1).strip()
         return BuildPlan("maven", "mvn -B -DskipTests package", "mvn -B test", version,
                          "pom.xml maven.compiler", f"maven:3-eclipse-temurin-{version or '17'}")
+    return None
 
+
+def _plan_gradle(repo: Path) -> Optional[BuildPlan]:
     if (repo / "build.gradle").is_file() or (repo / "build.gradle.kts").is_file():
         version = ""
         match = re.search(r"sourceCompatibility\s*=\s*['\"]?([0-9._]+)", _read(repo / "build.gradle"))
@@ -684,7 +772,10 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
             version = match.group(1)
         return BuildPlan("gradle", "gradle build -x test", "gradle test", version,
                          "build.gradle sourceCompatibility", f"gradle:jdk{(version or '17').split('.')[-1]}")
+    return None
 
+
+def _plan_python(repo: Path) -> Optional[BuildPlan]:
     if (repo / "pyproject.toml").is_file() or (repo / "requirements.txt").is_file() or (repo / "setup.py").is_file():
         version, source = "", ""
         pyver = repo / ".python-version"
@@ -697,7 +788,10 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
         install = "pip install -r requirements.txt" if (repo / "requirements.txt").is_file() else "pip install ."
         major = re.sub(r"[^0-9.]", "", version)[:4].rstrip(".") or "3.11"
         return BuildPlan("python", install, "pytest -q", version, source, f"python:{major}")
+    return None
 
+
+def _plan_ruby(repo: Path) -> Optional[BuildPlan]:
     if (repo / "Gemfile").is_file():
         version, source = "", ""
         ruby_version = repo / ".ruby-version"
@@ -710,35 +804,49 @@ def detect_build_plan(repo: Path) -> Optional[BuildPlan]:
         test = "bundle exec rspec" if (repo / "spec").is_dir() else "bundle exec rake test"
         return BuildPlan("ruby", "bundle install", test, version, source,
                          f"ruby:{version or '3.2'}")
+    return None
 
+
+def _plan_php(repo: Path) -> Optional[BuildPlan]:
     if (repo / "composer.json").is_file():
         data = _json(repo / "composer.json")
         version = str((data.get("require") or {}).get("php") or "").strip()
         return BuildPlan("php", "composer install --no-interaction --no-progress",
                          "vendor/bin/phpunit", version, "composer.json require.php",
-                         f"composer:2")
+                         "composer:2")
+    return None
 
+
+def _plan_cargo(repo: Path) -> Optional[BuildPlan]:
     if (repo / "Cargo.toml").is_file():
         match = re.search(r'rust-version\s*=\s*["\']([^"\']+)', _read(repo / "Cargo.toml"))
         version = match.group(1) if match else ""
         return BuildPlan("cargo", "cargo build --locked", "cargo test", version,
                          "Cargo.toml rust-version", f"rust:{version or '1'}")
+    return None
 
+
+def _plan_dotnet(repo: Path) -> Optional[BuildPlan]:
     csproj = list(repo.glob("*.csproj")) + list(repo.glob("**/*.csproj"))[:1]
     if csproj or (repo / "global.json").is_file():
         version = str((_json(repo / "global.json").get("sdk") or {}).get("version") or "")
         major = version.split(".")[0] or "8.0"
         return BuildPlan("dotnet", "dotnet build -c Release", "dotnet test", version,
                          "global.json sdk.version", f"mcr.microsoft.com/dotnet/sdk:{major}")
+    return None
 
+
+def _plan_make(repo: Path) -> Optional[BuildPlan]:
     if (repo / "Makefile").is_file():
         text = _read(repo / "Makefile")
         return BuildPlan("make", "make", "make test" if re.search(r"^test:", text, re.M) else "",
                          "", "", "")
+    return None
 
+
+def _plan_dockerfile(repo: Path) -> Optional[BuildPlan]:
     if (repo / "Dockerfile").is_file():
         return BuildPlan("docker", "docker build .", "", "", "Dockerfile FROM", "")
-
     return None
 
 
@@ -789,9 +897,12 @@ def docker_build_test(repo: Path, plan: BuildPlan, timeout: int) -> Dict[str, An
     }
 
 
-def collect_build_test(repo: Path, mode: str, timeout: int) -> Dict[str, Any]:
-    plan = detect_build_plan(repo)
+def collect_build_test(repo: Path, mode: str, timeout: int,
+                       primary_language: str = "") -> Dict[str, Any]:
+    all_plans = detect_build_plans(repo)
+    plan = detect_build_plan(repo, primary_language)
     row: Dict[str, Any] = {
+        "build_systems_detected": ",".join(p.system for p in all_plans),
         "build_system": plan.system if plan else "unknown",
         "build_command": plan.build_cmd if plan else "",
         "test_command": plan.test_cmd if plan else "",
@@ -820,9 +931,10 @@ CSV_COLUMNS = [
     "repo", "platform", "source", "analysis_branch", "default_branch",
     "logical_loc", "non_authored_loc", "non_authored_pct", "authored_loc",
     "vendored_loc", "generated_minified_loc",
+    "code_loc", "data_loc", "code_loc_pct", "primary_code_language", "top_data_languages",
     "duplication_ratio", "duplication_pct", "duplication_engine",
     "non_merge_commits", "revert_commits_excluded", "non_merge_commits_raw",
-    "build_test_status", "build_system", "build_command", "test_command",
+    "build_test_status", "build_system", "build_systems_detected", "build_command", "test_command",
     "runtime_version", "runtime_version_source", "ci_runs_tests", "dockerfile_present",
     "primary_language", "language_breakdown", "total_files", "authored_files",
     "contributors", "first_commit", "last_commit",
@@ -861,7 +973,8 @@ def process_repo(spec: RepoSpec, cfg: argparse.Namespace, scc_bin: str,
         if cfg.branch_mode == "latest" and branch != default:
             run(["git", "checkout", "--force", branch], clone_path, 600)
 
-        row.update(collect_loc(scc_bin, clone_path, cfg.exclude_dirs, cfg.scc_timeout))
+        row.update(collect_loc(scc_bin, clone_path, cfg.exclude_dirs, cfg.scc_timeout,
+                               cfg.data_languages))
 
         if jscpd_cmd:
             try:
@@ -880,7 +993,8 @@ def process_repo(spec: RepoSpec, cfg: argparse.Namespace, scc_bin: str,
                                          cfg.min_lines, cfg.dup_file_limit))
 
         row.update(non_merge_commits(clone_path, branch, cfg.git_timeout))
-        row.update(collect_build_test(clone_path, cfg.build_check, cfg.build_timeout))
+        row.update(collect_build_test(clone_path, cfg.build_check, cfg.build_timeout,
+                                      str(row.get("primary_code_language") or "")))
 
     except Exception as exc:  # noqa: BLE001 - record and continue with the next repo
         row["status"] = "error"
@@ -959,6 +1073,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--build-check", choices=["none", "detect", "docker"], default="detect",
                         help="detect = static build/runtime identification; docker = real build+test attempt")
     parser.add_argument("--exclude-dirs", default=",".join(DEFAULT_EXCLUDE_DIRS))
+    parser.add_argument("--data-languages", default=",".join(sorted(DATA_LANGUAGES)),
+                        help="languages treated as data when deriving code_loc; "
+                             "logical_loc is never affected")
     parser.add_argument("--wide-exclude", action="store_true",
                         help="also exclude third_party, Pods, target, .next and similar")
     parser.add_argument("--min-tokens", type=int, default=50)
@@ -988,6 +1105,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = build_parser().parse_args(argv)
 
     cfg.exclude_dirs = [d.strip() for d in cfg.exclude_dirs.split(",") if d.strip()]
+    cfg.data_languages = [d.strip() for d in cfg.data_languages.split(",") if d.strip()]
     if cfg.wide_exclude:
         cfg.exclude_dirs = list(dict.fromkeys(cfg.exclude_dirs + WIDE_EXTRA_EXCLUDE_DIRS))
 
