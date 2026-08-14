@@ -1,0 +1,17 @@
+# Secrets — never commit
+tokens
+.env
+**/.env
+*.pem
+.anthropic_key
+*service-account*.json
+
+# Run artefacts
+outputs/
+clones/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
