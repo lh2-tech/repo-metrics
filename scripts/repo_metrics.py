@@ -45,24 +45,39 @@ import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from workspace_paths import resolve_out  # noqa: E402  (single outputs root)
 
 HERE = Path(__file__).resolve().parent
 
 
 def default_tokens_file() -> Optional[Path]:
-    """Locate a key=value tokens file without hardcoding a workspace layout."""
-    env = os.environ.get("DATALABS_TOKENS")
+    """Locate the workspace env file without hardcoding a workspace layout.
+
+    DataLabs keeps exactly one env file at its root, so `.env` is preferred;
+    the legacy `tokens` name is still honoured for standalone checkouts.
+    """
+    env = os.environ.get("DATALABS_ENV_FILE") or os.environ.get("DATALABS_TOKENS")
     if env:
         return Path(env)
     for base in (Path.cwd(), *Path.cwd().parents, HERE, *HERE.parents):
-        candidate = base / "tokens"
-        if candidate.is_file():
-            return candidate
+        for name in (".env", "tokens"):
+            candidate = base / name
+            if candidate.is_file():
+                return candidate
     return None
 
 
 def default_clones_dir() -> str:
-    return os.environ.get("DATALABS_CLONES_DIR") or str(Path.cwd() / "clones" / "metrics")
+    """The one DataLabs repo store; falls back to ./clones when standalone."""
+    return os.environ.get("DATALABS_CLONES_DIR") or str(_datalabs_clones_root())
+
+
+def _datalabs_clones_root() -> Path:
+    """Walk up for a DataLabs root (marked by datalabs_paths.py) and use its clones/."""
+    for base in (Path.cwd(), *Path.cwd().parents, HERE, *HERE.parents):
+        if (base / "datalabs_paths.py").is_file():
+            return base / "clones"
+    return Path.cwd() / "clones"
 
 # Directories excluded from "authored" LOC and from duplication scanning.
 DEFAULT_EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrations"]
@@ -218,19 +233,27 @@ def parse_repo_entry(raw: str, default_platform: str = "github",
 
     expanded = Path(os.path.expanduser(entry))
     if expanded.exists() and expanded.is_dir():
-        return RepoSpec(entry, "local", expanded.name, None, expanded.resolve())
+        # Bare mirrors are named "<repo>.git"; drop the suffix so output rows and
+        # clone directories read as the repository name.
+        display = expanded.name[:-4] if expanded.name.endswith(".git") else expanded.name
+        return RepoSpec(entry, "local", display, None, expanded.resolve())
 
     scp = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+?)(?:\.git)?/?$", entry)
     if scp:
         host, path = scp.group(1), scp.group(2)
-        platform = "gitlab" if "gitlab" in host.lower() else "github" if "github" in host.lower() else "git"
+        platform = ("gitlab" if "gitlab" in host.lower() else
+                    "github" if "github" in host.lower() else
+                    "bitbucket" if "bitbucket" in host.lower() else "git")
         return RepoSpec(entry, platform, path, f"https://{host}/{path}.git", None)
 
     url = re.match(r"^https?://([^/]+)/(.+?)(?:\.git)?/?$", entry)
     if url:
         host, path = url.group(1), url.group(2)
         path = re.sub(r"/-/tree/.*$|/tree/.*$", "", path)
-        platform = "gitlab" if "gitlab" in host.lower() else "github" if "github" in host.lower() else "git"
+        path = re.sub(r"^([\w.-]+/[\w.-]+)/src/.*$", r"\1", path) if "bitbucket" in host.lower() else path
+        platform = ("gitlab" if "gitlab" in host.lower() else
+                    "github" if "github" in host.lower() else
+                    "bitbucket" if "bitbucket" in host.lower() else "git")
         return RepoSpec(entry, platform, path, f"https://{host}/{path}.git", None)
 
     if re.match(r"^[\w.-]+(/[\w.-]+)+$", entry):
@@ -299,6 +322,7 @@ def load_tokens(tokens_file: Optional[Path]) -> Dict[str, str]:
     for env_key, slot in (
         ("GH_TOKEN", "github"), ("GITHUB_TOKEN", "github"),
         ("GITLAB_TOKEN", "gitlab"), ("CI_JOB_TOKEN", "gitlab"),
+        ("BITBUCKET_ACCOUNT_SCOPED_TOKEN", "bitbucket"), ("BITBUCKET_TOKEN", "bitbucket"),
     ):
         value = os.environ.get(env_key)
         if value and slot not in tokens:
@@ -316,6 +340,8 @@ def load_tokens(tokens_file: Optional[Path]) -> Dict[str, str]:
                 tokens["github"] = value
             elif "gitlab" in key and "gitlab" not in tokens:
                 tokens["gitlab"] = value
+            elif "bitbucket" in key and "bitbucket" not in tokens:
+                tokens["bitbucket"] = value
     return tokens
 
 
@@ -324,7 +350,7 @@ def authed_url(clone_url: str, platform: str, tokens: Dict[str, str]) -> str:
     if not token or not clone_url.startswith("https://"):
         return clone_url
     rest = clone_url[len("https://"):]
-    user = "oauth2" if platform == "gitlab" else "x-access-token"
+    user = "oauth2" if platform == "gitlab" else "x-token-auth" if platform == "bitbucket" else "x-access-token"
     return f"https://{user}:{token}@{rest}"
 
 
@@ -336,12 +362,36 @@ def redact(text: str, tokens: Dict[str, str]) -> str:
 
 
 def ensure_clone(spec: RepoSpec, clones_dir: Path, tokens: Dict[str, str],
-                 timeout: int, blobless: bool) -> Tuple[Optional[Path], str]:
+                 timeout: int, blobless: bool,
+                 allow_non_git: bool = False,
+                 all_branches: bool = False) -> Tuple[Optional[Path], str]:
     """Return (path to a git working tree, note). Local repos are used in place."""
     if spec.local_path:
-        if not (spec.local_path / ".git").exists():
-            return None, "not a git repository"
-        return spec.local_path, "local"
+        if (spec.local_path / ".git").exists():
+            return spec.local_path, "local"
+
+        probe = run(["git", "rev-parse", "--is-bare-repository"], spec.local_path, 60)
+        if probe.ok and probe.out.strip() == "true":
+            # scc and jscpd need real files, which a bare mirror has none of, so
+            # materialise a working tree beside the other clones.
+            dest = clones_dir / "bare" / spec.name
+            if (dest / ".git").exists():
+                return dest, "cached worktree"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(dest, ignore_errors=True)
+            result = run(["git", "clone", str(spec.local_path), str(dest)], timeout=timeout)
+            if result.ok and (dest / ".git").exists():
+                return dest, "materialised from bare mirror"
+            shutil.rmtree(dest, ignore_errors=True)
+            return None, f"clone from bare mirror failed: {result.tail(300)}"
+
+        if allow_non_git:
+            # Zip-derived source exports carry no history. LOC, duplication and
+            # build detection still work; commit metrics are reported as blank
+            # rather than zero, so absence is never mistaken for a real count.
+            return spec.local_path, "non-git source tree"
+
+        return None, "not a git repository"
 
     dest = clones_dir / spec.platform / spec.name
     if (dest / ".git").exists():
@@ -354,10 +404,15 @@ def ensure_clone(spec: RepoSpec, clones_dir: Path, tokens: Dict[str, str],
     url = authed_url(spec.clone_url or "", spec.platform, tokens)
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="echo")
 
+    # --single-branch fetches only the default branch, which makes
+    # --branch-mode latest a no-op. Fetch every branch when the caller needs to
+    # choose between them.
+    scope: List[str] = [] if all_branches else ["--single-branch"]
+
     attempts: List[List[str]] = []
     if blobless:
-        attempts.append(["git", "clone", "--filter=blob:none", "--single-branch", url, str(dest)])
-    attempts.append(["git", "clone", "--single-branch", url, str(dest)])
+        attempts.append(["git", "clone", "--filter=blob:none", *scope, url, str(dest)])
+    attempts.append(["git", "clone", *scope, url, str(dest)])
 
     last = ""
     for cmd in attempts:
@@ -371,8 +426,21 @@ def ensure_clone(spec: RepoSpec, clones_dir: Path, tokens: Dict[str, str],
 
 # ── branch selection ─────────────────────────────────────────────────────────
 
+def branch_file_count(repo: Path, branch: str) -> int:
+    """Tracked file count on a branch, without checking it out."""
+    result = run(["git", "ls-tree", "-r", "--name-only", branch], repo, 300)
+    if not result.ok:
+        return -1
+    return sum(1 for line in result.out.splitlines() if line.strip())
+
+
 def resolve_branch(repo: Path, mode: str) -> Tuple[str, str]:
-    """Return (branch to measure, default branch)."""
+    """Return (branch to measure, default branch).
+
+    `latest` picks the newest commit, which fails when a trivial commit lands on
+    an otherwise empty branch. `largest` picks the branch carrying the most
+    tracked files, which is what "where the code lives" usually means.
+    """
     default = ""
     ref = run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], repo, 60)
     if ref.ok:
@@ -381,7 +449,7 @@ def resolve_branch(repo: Path, mode: str) -> Tuple[str, str]:
         head = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo, 60)
         default = head.out.strip() if head.ok else "HEAD"
 
-    if mode != "latest":
+    if mode not in ("latest", "largest"):
         return default, default
 
     listing = run(
@@ -389,6 +457,21 @@ def resolve_branch(repo: Path, mode: str) -> Tuple[str, str]:
          "refs/remotes/origin", "refs/heads"],
         repo, 120,
     )
+    if mode == "largest" and listing.ok:
+        best, best_n = default, branch_file_count(repo, default)
+        seen = 0
+        for line in listing.out.splitlines():
+            name = line.split("\t")[0].strip()
+            if not name or name.endswith("/HEAD"):
+                continue
+            seen += 1
+            if seen > 60:          # bound the cost on repos with hundreds of branches
+                break
+            n = branch_file_count(repo, name)
+            if n > best_n:
+                best, best_n = name, n
+        return best, default
+
     if listing.ok:
         for line in listing.out.splitlines():
             name = line.split("\t")[0].strip()
@@ -483,6 +566,39 @@ def collect_loc(scc_bin: str, repo: Path, exclude_dirs: Sequence[str],
 
 # ── metric 3: duplication ────────────────────────────────────────────────────
 
+def union_duplicated_lines(duplicates: List[Dict[str, Any]]) -> int:
+    """Count distinct source lines covered by at least one clone.
+
+    Each jscpd duplicate names two fragments; a line can appear in many, so the
+    ranges are merged per file before counting.
+    """
+    per_file: Dict[str, List[Tuple[int, int]]] = {}
+    for dup in duplicates:
+        for side in ("firstFile", "secondFile"):
+            info = dup.get(side) or {}
+            name = info.get("name")
+            start, end = info.get("start"), info.get("end")
+            if not name or start is None or end is None:
+                continue
+            lo, hi = int(start), int(end)
+            if hi < lo:
+                lo, hi = hi, lo
+            per_file.setdefault(name, []).append((lo, hi))
+
+    counted = 0
+    for spans in per_file.values():
+        spans.sort()
+        cur_lo, cur_hi = spans[0]
+        for lo, hi in spans[1:]:
+            if lo <= cur_hi + 1:
+                cur_hi = max(cur_hi, hi)
+            else:
+                counted += cur_hi - cur_lo + 1
+                cur_lo, cur_hi = lo, hi
+        counted += cur_hi - cur_lo + 1
+    return counted
+
+
 def jscpd_ratio(jscpd_cmd: List[str], repo: Path, report_dir: Path,
                 exclude_dirs: Sequence[str], min_tokens: int, min_lines: int,
                 timeout: int, gitignore: bool = True) -> Dict[str, Any]:
@@ -508,9 +624,28 @@ def jscpd_ratio(jscpd_cmd: List[str], repo: Path, report_dir: Path,
     data = json.loads(report.read_text(encoding="utf-8", errors="ignore") or "{}")
     total = ((data.get("statistics") or {}).get("total") or {})
     percentage = float(total.get("percentage") or 0.0)
+    total_lines = int(total.get("lines") or 0)
+
+    # jscpd's `percentage` sums each clone's line count, so a line belonging to
+    # several clone pairs is counted once per pair and the figure can exceed
+    # 100%. Recompute from the union of duplicated line ranges: the fraction of
+    # distinct lines appearing in at least one clone. That is what a duplication
+    # ratio means, and it cannot exceed 1.
+    unique_lines = union_duplicated_lines(data.get("duplicates") or [])
+    if total_lines and unique_lines:
+        ratio = min(unique_lines / total_lines, 1.0)
+        method = "union-of-clone-ranges"
+    else:
+        ratio = min(percentage / 100.0, 1.0)
+        method = "jscpd-percentage"
+
     return {
-        "duplication_ratio": round(percentage / 100.0, 4),
-        "duplication_pct": round(percentage, 2),
+        "duplication_ratio": round(ratio, 4),
+        "duplication_pct": round(ratio * 100, 2),
+        "duplication_pct_jscpd_raw": round(percentage, 2),
+        "duplication_unique_lines": unique_lines,
+        "duplication_method": method,
+        "duplication_overlapping": percentage > 100.0,
         "duplicated_lines": int(total.get("duplicatedLines") or 0),
         "duplication_scanned_lines": int(total.get("lines") or 0),
         "duplication_clones": int(total.get("clones") or 0),
@@ -897,8 +1032,37 @@ def docker_build_test(repo: Path, plan: BuildPlan, timeout: int) -> Dict[str, An
     }
 
 
+def find_dockerfiles(repo: Path, limit: int = 50) -> List[str]:
+    """Dockerfiles at any depth, not just the repo root.
+
+    Monorepos and service repos routinely keep them under docker/, deploy/ or
+    per-service subdirectories, so a root-only check reports 'no Dockerfile'
+    for repos that are fully containerised.
+    """
+    found: List[str] = []
+    listing = run(["git", "ls-files", "-z"], repo, 300)
+    if listing.ok:
+        for rel in listing.out.split("\0"):
+            rel = rel.strip()
+            if rel and re.search(r"(^|/)Dockerfile", rel, re.I):
+                found.append(rel)
+                if len(found) >= limit:
+                    break
+        return found
+    skip = {n.lower() for n in ALWAYS_SKIP_DIRS}
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d.lower() not in skip]
+        for name in files:
+            if re.match(r"Dockerfile", name, re.I):
+                found.append((Path(root) / name).relative_to(repo).as_posix())
+                if len(found) >= limit:
+                    return found
+    return found
+
+
 def collect_build_test(repo: Path, mode: str, timeout: int,
                        primary_language: str = "") -> Dict[str, Any]:
+    dockerfiles = find_dockerfiles(repo)
     all_plans = detect_build_plans(repo)
     plan = detect_build_plan(repo, primary_language)
     row: Dict[str, Any] = {
@@ -909,7 +1073,9 @@ def collect_build_test(repo: Path, mode: str, timeout: int,
         "runtime_version": plan.runtime if plan else "",
         "runtime_version_source": plan.runtime_source if plan else "",
         "container_image": plan.image if plan else "",
-        "dockerfile_present": (repo / "Dockerfile").is_file(),
+        "dockerfile_present": bool(dockerfiles),
+        "dockerfile_count": len(dockerfiles),
+        "dockerfile_paths": ";".join(dockerfiles[:5]),
         "ci_runs_tests": ci_runs_tests(repo),
         "build_test_status": "Not verified",
         "build_ok": "",
@@ -928,14 +1094,14 @@ def collect_build_test(repo: Path, mode: str, timeout: int,
 # ── per-repo driver ──────────────────────────────────────────────────────────
 
 CSV_COLUMNS = [
-    "repo", "platform", "source", "analysis_branch", "default_branch",
+    "repo", "platform", "source", "source_kind", "analysis_branch", "default_branch",
     "logical_loc", "non_authored_loc", "non_authored_pct", "authored_loc",
     "vendored_loc", "generated_minified_loc",
     "code_loc", "data_loc", "code_loc_pct", "primary_code_language", "top_data_languages",
-    "duplication_ratio", "duplication_pct", "duplication_engine",
+    "duplication_ratio", "duplication_pct", "duplication_pct_jscpd_raw", "duplication_method", "duplication_engine",
     "non_merge_commits", "revert_commits_excluded", "non_merge_commits_raw",
     "build_test_status", "build_system", "build_systems_detected", "build_command", "test_command",
-    "runtime_version", "runtime_version_source", "ci_runs_tests", "dockerfile_present",
+    "runtime_version", "runtime_version_source", "ci_runs_tests", "dockerfile_present", "dockerfile_count",
     "primary_language", "language_breakdown", "total_files", "authored_files",
     "contributors", "first_commit", "last_commit",
     "duplication_scanned_lines", "duplication_clones", "duplicated_lines",
@@ -961,17 +1127,22 @@ def process_repo(spec: RepoSpec, cfg: argparse.Namespace, scc_bin: str,
     cloned_fresh = False
     try:
         clone_path, note = ensure_clone(
-            spec, Path(cfg.clones_dir), tokens, cfg.clone_timeout, not cfg.full_clone
+            spec, Path(cfg.clones_dir), tokens, cfg.clone_timeout, not cfg.full_clone,
+            cfg.allow_non_git, cfg.branch_mode in ("latest", "largest"),
         )
         if clone_path is None:
             raise RuntimeError(note)
         cloned_fresh = note == "cloned"
+        has_git = note != "non-git source tree"
+        row["source_kind"] = "git" if has_git else "source-export"
 
-        branch, default = resolve_branch(clone_path, cfg.branch_mode)
-        row["analysis_branch"] = branch
-        row["default_branch"] = default
-        if cfg.branch_mode == "latest" and branch != default:
-            run(["git", "checkout", "--force", branch], clone_path, 600)
+        branch = ""
+        if has_git:
+            branch, default = resolve_branch(clone_path, cfg.branch_mode)
+            row["analysis_branch"] = branch
+            row["default_branch"] = default
+            if cfg.branch_mode in ("latest", "largest") and branch != default:
+                run(["git", "checkout", "--force", branch], clone_path, 600)
 
         row.update(collect_loc(scc_bin, clone_path, cfg.exclude_dirs, cfg.scc_timeout,
                                cfg.data_languages))
@@ -992,7 +1163,16 @@ def process_repo(spec: RepoSpec, cfg: argparse.Namespace, scc_bin: str,
             row.update(builtin_dup_ratio(clone_path, cfg.exclude_dirs, cfg.min_tokens,
                                          cfg.min_lines, cfg.dup_file_limit))
 
-        row.update(non_merge_commits(clone_path, branch, cfg.git_timeout))
+        if has_git:
+            row.update(non_merge_commits(clone_path, branch, cfg.git_timeout))
+        else:
+            # Blank, not 0 — there is no history to count, which is different
+            # from a repository that genuinely has no commits.
+            row.update({
+                "non_merge_commits": "", "non_merge_commits_raw": "",
+                "revert_commits_excluded": "", "contributors": "",
+                "first_commit": "", "last_commit": "",
+            })
         row.update(collect_build_test(clone_path, cfg.build_check, cfg.build_timeout,
                                       str(row.get("primary_code_language") or "")))
 
@@ -1065,7 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="key=value file with GitHub/GitLab tokens (env: DATALABS_TOKENS)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="process at most N repos")
-    parser.add_argument("--branch-mode", choices=["default", "latest"], default="default")
+    parser.add_argument("--branch-mode", choices=["default", "latest", "largest"], default="default")
     parser.add_argument("--default-platform", choices=["github", "gitlab"], default="github",
                         help="platform assumed for bare owner/repo lines")
     parser.add_argument("--gitlab-host", default="gitlab.com",
@@ -1086,6 +1266,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="skip jscpd and always use the built-in detector")
     parser.add_argument("--no-gitignore", action="store_true",
                         help="let the duplication scan see gitignored files (scc never does)")
+    parser.add_argument("--allow-non-git", action="store_true",
+                        help="measure source trees with no git history; commit "
+                             "metrics are left blank rather than reported as zero")
     parser.add_argument("--full-clone", action="store_true",
                         help="disable --filter=blob:none partial clones")
     parser.add_argument("--delete-clones", action="store_true",
@@ -1133,7 +1316,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"ERROR: no usable repo entries in {cfg.repos}")
         return 2
 
-    out_dir: Path = cfg.out
+    out_dir: Path = resolve_out(cfg.out)
     (out_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     Path(cfg.clones_dir).mkdir(parents=True, exist_ok=True)
     tokens = load_tokens(cfg.tokens_file)

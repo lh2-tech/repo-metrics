@@ -6,7 +6,6 @@ description: >-
   commit count, and build/test verification. Use when asked to measure a repo
   list, produce a due-diligence scorecard, or gather LOC/duplication/commit
   evidence across many repositories.
-disable-model-invocation: true
 ---
 
 # Repo Metrics (repo list → due-diligence scorecard)
