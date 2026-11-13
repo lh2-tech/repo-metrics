@@ -1245,7 +1245,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="key=value file with GitHub/GitLab tokens (env: DATALABS_TOKENS)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="process at most N repos")
-    parser.add_argument("--branch-mode", choices=["default", "latest", "largest"], default="default")
+    parser.add_argument("--branch-mode", choices=["default", "latest", "largest"], default="latest",
+                        help="branch measured: latest = newest commit (default), default = platform default branch, largest = most files")
     parser.add_argument("--default-platform", choices=["github", "gitlab"], default="github",
                         help="platform assumed for bare owner/repo lines")
     parser.add_argument("--gitlab-host", default="gitlab.com",

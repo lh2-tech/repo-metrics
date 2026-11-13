@@ -118,7 +118,7 @@ git@github.com:owner/repo.git
 | Flag | Effect |
 |------|--------|
 | `--build-check none\|detect\|docker` | `detect` (default) identifies build system, command and runtime version statically; `docker` attempts a real build and test run |
-| `--branch-mode latest` | measure the branch holding the newest commit instead of the default branch |
+| `--branch-mode latest\|default\|largest` | `latest` (default): measure the branch holding the newest commit; `default`: the platform default branch |
 | `--exclude-dirs a,b,c` | override the metric-2 exclusion list (default `vendor,node_modules,dist,build,generated,migrations`) |
 | `--wide-exclude` | also exclude `third_party`, `Pods`, `target`, `.next`, `coverage`, … |
 | `--delete-clones` | remove freshly cloned repos after measuring, to bound disk |
