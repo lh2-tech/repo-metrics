@@ -6,8 +6,8 @@ fields. The union of all columns is emitted, with blanks where a run predates a
 column, so old and new runs sit in one sheet without silently dropping data.
 
     python3 scripts/combine_runs.py \
-        --run fablead=outputs/fablead-metrics \
-        --run serpentcs-lh2=outputs/serpentcs-metrics \
+        --run org-a=outputs/org-a-metrics \
+        --run org-b=outputs/org-b-metrics \
         --out outputs/combined_repo_metrics.csv
 """
 
