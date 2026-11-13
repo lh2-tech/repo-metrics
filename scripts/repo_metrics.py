@@ -1013,7 +1013,7 @@ def docker_build_test(repo: Path, plan: BuildPlan, timeout: int) -> Dict[str, An
                 "build_log_tail": "no container recipe for this build system"}
 
     mount = f"{repo}:/src"
-    base = ["docker", "run", "--rm", "-v", mount, "-w", "/src", plan.image, "sh", "-lc"]
+    base = ["docker", "run", "--rm", "-v", mount, "-w", "/src", plan.image, "sh", "-c"]
 
     build = run(base + [plan.build_cmd], timeout=timeout)
     if not build.ok:
