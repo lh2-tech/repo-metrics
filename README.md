@@ -3,19 +3,6 @@
 Due-diligence metrics for a list of git repositories (GitHub, GitLab, Bitbucket
 or local clones), plus an optional sample of each repo's oldest commits.
 
-## What it measures
-
-| Column | Meaning |
-|--------|---------|
-| `logical_loc` | `scc` code lines, whole repo |
-| `non_authored_loc` | `logical_loc` minus authored LOC (vendored, generated and minified code removed) |
-| `code_loc` / `data_loc` | LOC split between source and data/markup languages |
-| `duplication_ratio` | `jscpd` duplication (built-in fallback if `jscpd`/Node is missing; labelled in `duplication_engine`) |
-| `non_merge_commits` | `git log --no-merges`, revert commits dropped |
-| `build_test_status` | detected build system, command and runtime version; `docker` mode attempts a real build |
-
-Full column list and measurement caveats are in [SKILL.md](SKILL.md).
-
 ## Scripts
 
 | Script | Use |
@@ -52,15 +39,15 @@ next time unless `--force` is given. A failing repo is recorded, never fatal.
 
 ## Output
 
-`repo_metrics.csv`, `repo_metrics.jsonl`, `summary.json`, `artifacts/`. With
-`run_metrics_and_sample.py` also `samples/<repo>/` (optionally `.zip`),
-`sample_report.csv` and `run_report.json`.
+`repo_metrics.csv`, one row per repo:
 
-The sample is the oldest N% of commits **by count**, on one branch; other
-branches, the reflog and the origin remote are dropped. It is not PII-scrubbed.
+| Repo | Logical LOC (excludes blanks & comments) | Non-Authored LOC (auto-gen + vendored + deps) | Duplication Ratio (0.00-1.00) | Non-Merge Commit Count | Builds & Tests |
+|---|---|---|---|---|---|
+| lh2-tech/codebase-profiler | 14221 | 1 | 0.0188 | 69 | Build + Test present |
+| lh2-tech/repo-metrics | 2239 | 0 | 0.0075 | 5 | Build + Test present |
+| owner/missing-repo | | | | | FAILED: repository not found |
 
-## Notes
+`Builds & Tests` reads `Build + Test present` when the repo has a Dockerfile and `Not verified` otherwise.
 
-Some scripts look for a `datalabs_paths.py` in a parent directory to locate
-shared env/output/clone folders. Standalone, they fall back to `./clones`,
-`--out` and the environment, so that file is not required.
+Also written: `repo_metrics_detailed.csv` (every measured column), `repo_metrics.jsonl`, `summary.json` and `artifacts/`.
+With `run_metrics_and_sample.py` you also get `samples/<repo>/` (optionally `.zip`), `sample_report.csv` and `run_report.json`.

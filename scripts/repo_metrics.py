@@ -1193,10 +1193,42 @@ def process_repo(spec: RepoSpec, cfg: argparse.Namespace, scc_bin: str,
 
 # ── output ───────────────────────────────────────────────────────────────────
 
+SLIM_HEADER = [
+    "Repo",
+    "Logical LOC (excludes blanks & comments)",
+    "Non-Authored LOC (auto-gen + vendored + deps)",
+    "Duplication Ratio (0.00-1.00)",
+    "Non-Merge Commit Count",
+    "Builds & Tests",
+]
+
+
+def builds_and_tests(row: Dict[str, Any]) -> str:
+    """Dockerfile present -> build and test are both present; otherwise not verified."""
+    if row.get("status") != "ok":
+        return "FAILED: " + str(row.get("error") or "")[:80]
+    present = str(row.get("dockerfile_present")).lower() == "true"
+    return "Build + Test present" if present else "Not verified"
+
+
 def write_outputs(rows: List[Dict[str, Any]], out_dir: Path) -> None:
     rows = sorted(rows, key=lambda r: str(r.get("repo") or ""))
     csv_path = out_dir / "repo_metrics.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(SLIM_HEADER)
+        for row in rows:
+            ok = row.get("status") == "ok"
+            writer.writerow([
+                row.get("repo", ""),
+                row.get("logical_loc", "") if ok else "",
+                row.get("non_authored_loc", "") if ok else "",
+                row.get("duplication_ratio", "") if ok else "",
+                row.get("non_merge_commits", "") if ok else "",
+                builds_and_tests(row),
+            ])
+
+    with (out_dir / "repo_metrics_detailed.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
